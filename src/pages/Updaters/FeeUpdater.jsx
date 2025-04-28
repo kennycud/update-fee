@@ -1,7 +1,5 @@
 import {List, ListItem, ListItemText, Menu, MenuItem} from "@mui/material";
-import React, {useCallback, useEffect, useRef} from "react";
-import {useSelector} from "react-redux";
-import {utf8ToBase64} from "./Utf8ToBase64.jsx";
+import React, {useCallback, useEffect, useRef, useState} from "react";
 
 const coins = ['BTC', 'LTC', 'DOGE', 'DGB', 'RVN', 'ARRR' ];
 const types = ['LOCKING', 'UNLOCKING'];
@@ -13,22 +11,110 @@ export const FeeUpdater = () => {
 
     const [editFee, setEditFee] = React.useState([]);
     const [savedFee, setSavedFee] = React.useState([]);
-    const [fetch, setFetch] = React.useState([]);
-    const [anotherName, setAnotherName] = React.useState([]);
-    const [anotherFetch, setAnotherFetch] = React.useState([]);
-    const registeredName = useSelector((state) => state.auth?.user?.name);
     const [unit, setUnit] = React.useState([]);
     const LOCKING_UNIT = 'sat/kb';
     const UNLOCKING_UNIT = 'total sats';
 
-    const SAVED_FEE_DESCRIPTION = 'The saved fee is saved to the core server. If the core server restarts, the saved fee is reset to the default value.';
-    const BUYER_LOCKING_FEE_DESCRIPTION = 'The QORT buyer uses the saved locking fee when broadcasting their foreign coin transaction to a foreign blockchain for the QORT seller to see. This fee is multiplied by the size (in KB) of the transaction.';
-    const BUYER_UNLOCKING_FEE_DESCRIPTION = 'The QORT buyer uses the saved unlocking fee when broadcasting their foreign coin transaction to complete the trade. This is set for the total transaction size (total sats). The total transaction size is approximately 300 KB.';
-    const SELLER_FEE_DESCRIPTION = "The QORT seller does not use the saved locking fee. The QORT seller uses the saved unlocking fee when accepting or rejecting the Qort buyer's unlocking transaction.";
-    const PUBLISH_FEE_DESCRIPTION_1 = 'A user can publish their fees to QDN.'
-    const PUBLISH_FEE_DESCRIPTION_2 = 'If a user publishes their fees, they can always retrieve them after their core server restarts by using the match button.'
-    const SELLER_PUBLISH_FEE_DESCRIPTION = 'The QORT seller can publish their fees to communicate to QORT buyers what fees they are accepting and rejecting.'
-    const BUYER_PUBLISH_FEE_DESCRIPTION = "The QORT buyer can match the seller's required fees by typing in their name, fetching their fee requirement and using the match button."
+    const socketRef = useRef(null);
+
+    // for the sign button
+    const [isButtonEnabled, setIsButtonEnabled] = useState(true);
+
+    /**
+     * Init Sign Button Status
+     *
+     * If there are unsigned fees for the user's account address, then the sign button should be enabled,
+     * otherwise the button should be disabled.
+     *
+     * @returns {Promise<void>}
+     */
+    async function initSignButtonStatus() {
+
+        let account = await qortalRequest({
+            action: "GET_USER_ACCOUNT"
+        });
+
+        // fetch the unsigned fees for the user's account address
+        const response = await fetch("/crosschain/unsignedfees/" + account.address);
+        const unsignedFees = await response.json();
+
+        // if there are unsigned fees to sign, then enable button
+        if(unsignedFees.length > 0) {
+            setIsButtonEnabled(true);
+        }
+        // if there are not unsigned fees to sign, the disable button
+        else {
+            setIsButtonEnabled(false);
+        }
+    }
+
+    initSignButtonStatus();
+
+    /**
+     * Initialize Unsigned Fees Socket
+     *
+     * This will receive an empty object for every new unsigned fee added to the node.
+     */
+    function initSocket() {
+        let socketTimeout;
+        let socketLink = `${
+            window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+        }//${window.location.host}/websockets/crosschain/unsignedfees`;
+
+        socketRef.current = new WebSocket(socketLink);
+        socketRef.current.onopen = () => {
+            setTimeout(pingSocket, 50);
+        }
+
+        socketRef.current.onmessage = (event) => {
+
+            const data = JSON.parse(event.data);
+
+            async function updateSignButtonStatus() {
+                try {
+                    let account = await qortalRequest({
+                        action: "GET_USER_ACCOUNT"
+                    });
+
+                    if (account.address === data.address) {
+
+                        if (data.positive) {
+                            setIsButtonEnabled(true);
+                        } else {
+                            setIsButtonEnabled(false);
+                        }
+                    }
+                } catch(e) {
+                    console.log("Error: " + e);
+                }
+            }
+
+            updateSignButtonStatus();
+        }
+        socketRef.current.onclose = () => {
+            console.log('close');
+        }
+        socketRef.current.onerror = () => {
+            clearTimeout(socketTimeout);
+        }
+        const pingSocket = () => {
+            socketRef.current.send("ping");
+            socketTimeout = setTimeout(pingSocket, 295000);
+        }
+    }
+
+    /**
+     * Use this to initialize the unsigned fees socket.
+     */
+    useEffect(() => {
+        initSocket();
+
+        return () => {
+            if( socketRef.current) {
+                socketRef.current.close(1000, "forced");
+            }
+        };
+    }, []);
 
     /**
      * Establish Update Fee Form
@@ -37,9 +123,6 @@ export const FeeUpdater = () => {
      */
     const establishUpdateFeeForm = useCallback(async () => {
 
-        // clear out the fetch values
-        setFetch('');
-
         // if the coin or type is not set, then abort
         if( typeof coin.current === 'undefined' || typeof type.current === 'undefined') {
             setFees('');
@@ -47,7 +130,7 @@ export const FeeUpdater = () => {
         }
 
         const coinRequest = coin.current.toLowerCase();
-        const typeRequest = (type.current == 'LOCKING') ? 'feekb' : 'feeceiling';
+        const typeRequest = (type.current == 'LOCKING') ? 'feekb' : 'feerequired';
 
         try {
             const response = await qortalRequestWithTimeout({
@@ -63,36 +146,10 @@ export const FeeUpdater = () => {
         }
     }, [])
 
-    const displayFetchData = useCallback( async() => {
-        // if the coin or type is not set, then abort
-        if( typeof coin.current === 'undefined' || typeof type.current === 'undefined') {
-            setFetch('');
-            return;
-        }
-        try {
-            const response = await qortalRequestWithTimeout({
-                action: "FETCH_QDN_RESOURCE",
-                name: registeredName,
-                service: "ARBITRARY_DATA",
-                identifier: getIdentifier()
-            }, 1800000);
-
-            setFetch(response);
-        } catch (error) {
-            console.error(error)
-            setFetch('');
-        }
-    }, [registeredName])
-
-    const clearAnotherFetch = useCallback( async() => {
-        setAnotherName('');
-        setAnotherFetch('');
-    }, []);
-
     useEffect(() => {
 
         console.log('editFee or fetch changed');
-    }, [editFee,fetch]);
+    }, [editFee]);
 
     const [anchorCoinEl, setAnchorCoinEl] = React.useState(null);
     const [selectedCoinIndex, setSelectedCoinIndex] = React.useState();
@@ -108,8 +165,6 @@ export const FeeUpdater = () => {
 
         coin.current = coins[index];
         establishUpdateFeeForm();
-        displayFetchData();
-        clearAnotherFetch();
     };
 
     const handleCoinClose = () => {
@@ -132,8 +187,6 @@ export const FeeUpdater = () => {
         type.current === 'LOCKING' ? setUnit(LOCKING_UNIT ) : setUnit(UNLOCKING_UNIT);
 
         establishUpdateFeeForm();
-        displayFetchData();
-        clearAnotherFetch();
     };
 
     const handleTypeClose = () => {
@@ -147,7 +200,7 @@ export const FeeUpdater = () => {
         }
 
         const coinRequest = coin.current.toLowerCase();
-        const typeRequest = (type.current == 'LOCKING') ? 'feekb' : 'feeceiling';
+        const typeRequest = (type.current == 'LOCKING') ? 'feekb' : 'feerequired';
 
         try {
             const response = await qortalRequestWithTimeout({
@@ -169,72 +222,38 @@ export const FeeUpdater = () => {
         saveFormData();
     }
 
-    function getIdentifier() {
-        return coin.current + '-' + type.current;
-    }
+    /**
+     * Sign For Fees
+     *
+     * Sign all unsigned fees for the user account's address.
+     *
+     * @returns {Promise<void>}
+     */
+    const signForeignFees  = async() => {
 
-    const publishFormData  = async() => {
-
-        let base64 = utf8ToBase64(editFee);
         try {
             await qortalRequest({
-                action: "PUBLISH_QDN_RESOURCE",
-                name: registeredName,
-                service: "ARBITRARY_DATA",
-                data64: base64,
-                identifier: getIdentifier()
+                action: "SIGN_FOREIGN_FEES"
             });
 
-            displayFetchData();
         } catch (error) {
             console.error(error)
         }
     }
 
-    const onPublish = async(event) => {
+    /**
+     * On Signing
+     *
+     * Called when the user clicks the signing button.
+     *
+     * @param event the event
+     *
+     * @returns {Promise<void>}
+     */
+    const onSigning = async(event) => {
         event.preventDefault();
 
-        publishFormData();
-    }
-
-    const displayNameData = async() => {
-        // if the coin or type is not set, then abort
-        if( anotherName === '' || typeof coin.current === 'undefined' || typeof type.current === 'undefined') {
-            setAnotherFetch('');
-            return;
-        }
-
-        try {
-            const response = await qortalRequestWithTimeout({
-                action: "FETCH_QDN_RESOURCE",
-                name: anotherName,
-                service: "ARBITRARY_DATA",
-                identifier: getIdentifier()
-            }, 1800000);
-
-            setAnotherFetch(response);
-        } catch (error) {
-            console.error(error)
-            setAnotherFetch('');
-        }
-    }
-
-    const onAnotherName = async(event) => {
-        event.preventDefault();
-
-        displayNameData();
-    }
-
-    const onMatchMine = async(event) => {
-        event.preventDefault();
-
-        setEditFee(fetch);
-    }
-
-    const onMatchOther = async(event) => {
-        event.preventDefault();
-
-        setEditFee(anotherFetch)
+        signForeignFees();
     }
 
     function setFees(value) {
@@ -348,76 +367,11 @@ export const FeeUpdater = () => {
                         <button type="submit">Save</button>
                     </div>
                 </form>
-                <form onSubmit={onPublish}>
+                <form onSubmit={onSigning}>
                     <div>
-                        <button type="submit">Publish</button>
+                        <button type="submit" disabled={!isButtonEnabled}>Sign</button>
                     </div>
                 </form>
-            </div>
-            <div>
-                <div>
-                    <label>{SAVED_FEE_DESCRIPTION}</label>
-                </div>
-                <div>
-                    <label>{BUYER_LOCKING_FEE_DESCRIPTION}</label>
-                </div>
-                <div>
-                    <label>{BUYER_UNLOCKING_FEE_DESCRIPTION}</label>
-                </div>
-                <div>
-                    <label>{SELLER_FEE_DESCRIPTION}</label>
-                </div>
-            </div>
-            <div>
-                <div>
-                    <label>{registeredName}</label>
-                </div>
-                <div>
-                    <label>{fetch} {unit}</label>
-                </div>
-                <form onSubmit={onMatchMine}>
-                    <div>
-                        <button type="submit">Match</button>
-                    </div>
-                </form>
-            </div>
-
-            <div>
-                <form onSubmit={onAnotherName}>
-                    <div>
-                        <label htmlFor="anotherName">Name</label>
-                        <input type="text"
-                               id="anotherName"
-                               value={anotherName}
-                               onChange={(e) => setAnotherName(e.target.value)}
-                        />
-                    </div>
-                    <div>
-                        <button type="submit">Fetch Fee Requirement</button>
-                    </div>
-                    <div>
-                        <label>{anotherFetch} {unit}</label>
-                    </div>
-                </form>
-                <form onSubmit={onMatchOther}>
-                    <div>
-                     <button type="submit">Match</button>
-                    </div>
-                </form>
-            </div>
-            <div>
-                <div>
-                    <label>{PUBLISH_FEE_DESCRIPTION_1}</label>
-                </div>
-                <div>
-                    <label>{PUBLISH_FEE_DESCRIPTION_2}</label>
-                </div>
-                <div>
-                    <label>{SELLER_PUBLISH_FEE_DESCRIPTION}</label>
-                </div>
-                <div>
-                    <label>{BUYER_PUBLISH_FEE_DESCRIPTION}</label>
-                </div>
             </div>
         </div>
     );
